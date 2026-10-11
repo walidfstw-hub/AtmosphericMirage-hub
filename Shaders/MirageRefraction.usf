@@ -1,0 +1,424 @@
+// Depth-tested curved-ray atmospheric refraction for inferior and superior mirages.
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ScreenPass.ush"
+#include "/Engine/Private/SceneTexturesCommon.ush"
+
+Texture2D SceneColorTexture;
+SamplerState SceneColorSampler;
+
+// x: turbulence strength, y: horizon, z: band height, w: type (0 inferior, 1 superior)
+float4 MirageParameters0;
+// x: turbulence speed, y: turbulence scale, z: reflection weight, w: looming weight
+float4 MirageParameters1;
+// x: pressure kPa, y: base temperature K, z: dT/dz K/m, w: layer base world Z in cm
+float4 AtmosphereParameters0;
+// x: layer thickness m, y: max trace distance m, z: branch angular separation, w: diagnostic mode
+float4 AtmosphereParameters1;
+// x: exponential scale height m, y: lateral half-width m, z/w: world X range m
+float4 AtmosphereParameters2;
+uint MirageGeometryCount;
+float4 MirageGeometryMin[24];
+float4 MirageGeometryMax[24];
+float4 MirageGeometryColor[24];
+// x: first triangle, y: triangle count, z: actual-mesh flag
+float4 MirageGeometryTriangleRange[24];
+uint MirageTriangleVertexCount;
+StructuredBuffer<float4> MirageTriangleVertices;
+StructuredBuffer<float4> MirageTriangleNormals;
+StructuredBuffer<float4> MirageTriangleUVs;
+
+static const float RefractivityConstant = 7.86e-4;
+static const uint RayStepCount = 128;
+
+float MirageNoise(float2 P)
+{
+	float A = sin(P.x * 1.13 + sin(P.y * 0.71));
+	float B = sin(P.x * 0.47 - P.y * 1.37 + 1.9);
+	return (A + 0.55 * B) / 1.55;
+}
+
+void EvaluateAtmosphere(float3 WorldPositionMeters, out float RefractiveIndex, out float DnDz)
+{
+	float LayerBaseMeters = AtmosphereParameters0.w * 0.01;
+	float WorldHeightMeters = WorldPositionMeters.z;
+	float HeightInLayer = clamp(WorldHeightMeters - LayerBaseMeters, 0.0, AtmosphereParameters1.x);
+	float SurfaceGradient = AtmosphereParameters0.z;
+	float ScaleHeight = max(AtmosphereParameters2.x, 0.05);
+	float Decay = exp(-HeightInLayer / ScaleHeight);
+	// Integrating dT/dz = SurfaceGradient*exp(-z/H) gives a finite, stable boundary layer.
+	float Temperature = max(AtmosphereParameters0.y + SurfaceGradient * ScaleHeight * (1.0 - Decay), 180.0);
+	float LateralFeather = max(AtmosphereParameters2.y * 0.18, 0.25);
+	float LateralWeight = saturate((AtmosphereParameters2.y - abs(WorldPositionMeters.y)) / LateralFeather);
+	float LongitudinalWeight = saturate((WorldPositionMeters.x - AtmosphereParameters2.z) / 25.0) *
+		saturate((AtmosphereParameters2.w - WorldPositionMeters.x) / 25.0);
+	float FootprintWeight = LateralWeight * LongitudinalWeight;
+	float ActiveGradient = (FootprintWeight > 0.0 && WorldHeightMeters >= LayerBaseMeters &&
+		WorldHeightMeters <= LayerBaseMeters + AtmosphereParameters1.x)
+		? lerp(-0.0065, SurfaceGradient * Decay, FootprintWeight) : -0.0065;
+	RefractiveIndex = 1.0 + RefractivityConstant * AtmosphereParameters0.x / Temperature;
+	DnDz = -RefractivityConstant * AtmosphereParameters0.x * ActiveGradient / (Temperature * Temperature);
+}
+
+struct FCurvedRayHit
+{
+	float2 UV;
+	float3 Color;
+	float DistanceMeters;
+	float Valid;
+	float GeometryHit;
+	float SkyTurn;
+	float BoxHit;
+	float SurfaceSampleValid;
+};
+
+bool SegmentIntersectsBox(float3 SegmentStart, float3 SegmentEnd, float3 BoxMin, float3 BoxMax)
+{
+	float3 Delta = SegmentEnd - SegmentStart;
+	float3 SafeDelta = float3(
+		abs(Delta.x) < 1e-5 ? (Delta.x < 0.0 ? -1e-5 : 1e-5) : Delta.x,
+		abs(Delta.y) < 1e-5 ? (Delta.y < 0.0 ? -1e-5 : 1e-5) : Delta.y,
+		abs(Delta.z) < 1e-5 ? (Delta.z < 0.0 ? -1e-5 : 1e-5) : Delta.z);
+	float3 T0 = (BoxMin - SegmentStart) / SafeDelta;
+	float3 T1 = (BoxMax - SegmentStart) / SafeDelta;
+	float3 NearT = min(T0, T1);
+	float3 FarT = max(T0, T1);
+	float Enter = max(max(NearT.x, NearT.y), NearT.z);
+	float Exit = min(min(FarT.x, FarT.y), FarT.z);
+	return Exit >= max(Enter, 0.0) && Enter <= 1.0;
+}
+
+bool SegmentCrossesRoadObject(float3 SegmentStart, float3 SegmentEnd,
+	float3 BoxMin, float3 BoxMax, out float CrossingT)
+{
+	float PlaneX = 0.5 * (BoxMin.x + BoxMax.x);
+	float Denominator = SegmentEnd.x - SegmentStart.x;
+	if (abs(Denominator) < 1e-5)
+	{
+		CrossingT = 0.0;
+		return false;
+	}
+	CrossingT = (PlaneX - SegmentStart.x) / Denominator;
+	float3 Crossing = lerp(SegmentStart, SegmentEnd, CrossingT);
+	// This is deliberately a conservative broad phase.  The following triangle
+	// test resolves the object's exact lateral silhouette; rejecting on the thin
+	// Y extent here can discard a valid curved segment before that exact test.
+	return CrossingT >= 0.0 && CrossingT <= 1.0 &&
+		Crossing.z >= BoxMin.z && Crossing.z <= BoxMax.z;
+}
+
+bool SegmentIntersectsTriangle(float3 SegmentStart, float3 SegmentEnd,
+	float3 V0, float3 V1, float3 V2, out float HitT, out float2 HitBarycentrics)
+{
+	float3 Direction = SegmentEnd - SegmentStart;
+	float3 Edge1 = V1 - V0;
+	float3 Edge2 = V2 - V0;
+	float3 P = cross(Direction, Edge2);
+	float Determinant = dot(Edge1, P);
+	if (abs(Determinant) < 1e-7)
+	{
+		HitT = 0.0;
+		HitBarycentrics = 0.0;
+		return false;
+	}
+	float InverseDeterminant = 1.0 / Determinant;
+	float3 T = SegmentStart - V0;
+	float U = dot(T, P) * InverseDeterminant;
+	float3 Q = cross(T, Edge1);
+	float V = dot(Direction, Q) * InverseDeterminant;
+	float CandidateT = dot(Edge2, Q) * InverseDeterminant;
+	bool Hit = U >= 0.0 && V >= 0.0 && U + V <= 1.0 && CandidateT >= 0.0 && CandidateT <= 1.0;
+	HitT = CandidateT;
+	HitBarycentrics = float2(U, V);
+	return Hit;
+}
+
+FCurvedRayHit TraceCurvedRay(float2 StartUV, float VerticalLaunchOffset)
+{
+	FCurvedRayHit Result;
+	Result.UV = StartUV;
+	Result.Color = 0.0;
+	Result.DistanceMeters = AtmosphereParameters1.y;
+	Result.Valid = 0.0;
+	Result.GeometryHit = 0.0;
+	Result.SkyTurn = 0.0;
+	Result.BoxHit = 0.0;
+	Result.SurfaceSampleValid = 0.0;
+
+	float2 ScreenPosition = ViewportUVToScreenPos(StartUV);
+	float3 RayOrigin = View.TranslatedWorldCameraOrigin;
+	// ScreenToTranslatedWorld receives w=0 when reconstructing a perspective view ray.
+	// Supplying w=1 produces a translated position and then subtracting the camera a
+	// second time corrupts the world-space direction (most visibly on long traces).
+	float3 RayDirection = normalize(
+		mul(float4(ScreenPosition, 1.0, 0.0), View.ScreenToTranslatedWorld).xyz);
+	RayDirection = normalize(RayDirection + float3(0.0, 0.0, VerticalLaunchOffset));
+
+	float StepMeters = AtmosphereParameters1.y / RayStepCount;
+	float StepCentimeters = StepMeters * 100.0;
+	float3 RayPosition = RayOrigin;
+
+	LOOP
+	for (uint StepIndex = 0; StepIndex < RayStepCount; ++StepIndex)
+	{
+		// UE 5.6 stores the large-world pre-view translation as high/low components.
+		float3 PreViewTranslation = View.PreViewTranslationHigh + View.PreViewTranslationLow;
+		float3 WorldPositionMeters = (RayPosition - PreViewTranslation) * 0.01;
+		float RefractiveIndex;
+		float DnDz;
+		EvaluateAtmosphere(WorldPositionMeters, RefractiveIndex, DnDz);
+
+		// d(direction)/ds follows from d/ds(n*direction)=grad(n).
+		float3 GradN = float3(0.0, 0.0, DnDz);
+		float3 DirectionDerivative = (GradN - RayDirection * dot(RayDirection, GradN)) / RefractiveIndex;
+		float PreviousVerticalDirection = RayDirection.z;
+		RayDirection = normalize(RayDirection + DirectionDerivative * StepMeters);
+		float3 PreviousRayPosition = RayPosition;
+		RayPosition += RayDirection * StepCentimeters;
+
+		LOOP
+		for (uint GeometryIndex = 0; GeometryIndex < min(MirageGeometryCount, 24u); ++GeometryIndex)
+		{
+			float3 BoxMinTranslated = MirageGeometryMin[GeometryIndex].xyz + PreViewTranslation;
+			float3 BoxMaxTranslated = MirageGeometryMax[GeometryIndex].xyz + PreViewTranslation;
+			float ObjectPlaneT;
+			bool HasTriangleGeometry = MirageGeometryTriangleRange[GeometryIndex].z > 0.5;
+			if (HasTriangleGeometry && AtmosphereParameters1.w >= 2.5)
+			{
+				float PlaneX = 0.5 * (BoxMinTranslated.x + BoxMaxTranslated.x);
+				float PlaneDenominator = RayPosition.x - PreviousRayPosition.x;
+				if (abs(PlaneDenominator) >= 1e-5)
+				{
+					float PlaneT = (PlaneX - PreviousRayPosition.x) / PlaneDenominator;
+					if (PlaneT >= 0.0 && PlaneT <= 1.0)
+					{
+						float CrossingWorldZ = lerp(PreviousRayPosition, RayPosition, PlaneT).z - PreViewTranslation.z;
+						// Encode -10..40 metres above the layer base into 0..1 for readback.
+						Result.BoxHit = saturate((CrossingWorldZ - AtmosphereParameters0.w + 1000.0) / 5000.0);
+					}
+				}
+			}
+			bool BoundsHit = HasTriangleGeometry
+				? SegmentCrossesRoadObject(PreviousRayPosition, RayPosition, BoxMinTranslated, BoxMaxTranslated, ObjectPlaneT)
+				: SegmentIntersectsBox(PreviousRayPosition, RayPosition, BoxMinTranslated, BoxMaxTranslated);
+			if (BoundsHit)
+			{
+				Result.BoxHit = 1.0;
+				if (HasTriangleGeometry)
+				{
+					uint FirstTriangle = (uint)MirageGeometryTriangleRange[GeometryIndex].x;
+					uint TriangleCount = (uint)MirageGeometryTriangleRange[GeometryIndex].y;
+					float ClosestT = 2.0;
+					float3 ClosestNormal = 0.0;
+					float2 ClosestUV = 0.0;
+					LOOP
+					for (uint TriangleOffset = 0; TriangleOffset < TriangleCount; ++TriangleOffset)
+					{
+						uint VertexBase = (FirstTriangle + TriangleOffset) * 3u;
+						if (VertexBase + 2u >= MirageTriangleVertexCount)
+						{
+							break;
+						}
+						float3 V0 = MirageTriangleVertices[VertexBase].xyz + PreViewTranslation;
+						float3 V1 = MirageTriangleVertices[VertexBase + 1u].xyz + PreViewTranslation;
+						float3 V2 = MirageTriangleVertices[VertexBase + 2u].xyz + PreViewTranslation;
+						float TriangleT;
+						float2 TriangleBarycentrics;
+						if (SegmentIntersectsTriangle(PreviousRayPosition, RayPosition, V0, V1, V2,
+							TriangleT, TriangleBarycentrics) && TriangleT < ClosestT)
+						{
+							ClosestT = TriangleT;
+							float BarycentricW = 1.0 - TriangleBarycentrics.x - TriangleBarycentrics.y;
+							ClosestNormal = normalize(
+								MirageTriangleNormals[VertexBase].xyz * BarycentricW +
+								MirageTriangleNormals[VertexBase + 1u].xyz * TriangleBarycentrics.x +
+								MirageTriangleNormals[VertexBase + 2u].xyz * TriangleBarycentrics.y);
+							ClosestUV = MirageTriangleUVs[VertexBase].xy * BarycentricW +
+								MirageTriangleUVs[VertexBase + 1u].xy * TriangleBarycentrics.x +
+								MirageTriangleUVs[VertexBase + 2u].xy * TriangleBarycentrics.y;
+						}
+					}
+					if (ClosestT <= 1.0)
+					{
+						float3 SunDirection = normalize(float3(-0.42, 0.31, 0.85));
+						float Lighting = 0.24 + 0.76 * abs(dot(ClosestNormal, SunDirection));
+						// GeometryColor is linear material base colour.  This callback runs after
+						// Tonemap, so encode the fallback once for display instead of tonemapping it twice.
+						Result.Color = pow(saturate(MirageGeometryColor[GeometryIndex].rgb * Lighting), 1.0 / 2.2);
+						float3 HitPosition = lerp(PreviousRayPosition, RayPosition, ClosestT);
+						float4 HitClip = mul(float4(HitPosition, 1.0), View.TranslatedWorldToClip);
+						if (HitClip.w > 0.0)
+						{
+							float2 HitUV = ScreenPosToViewportUV(HitClip.xy / HitClip.w);
+							if (all(HitUV > 0.001) && all(HitUV < 0.999))
+							{
+								Result.UV = HitUV;
+								Result.SurfaceSampleValid = 1.0;
+							}
+						}
+						Result.DistanceMeters = (StepIndex + ClosestT) * StepMeters;
+						Result.Valid = 1.0;
+						Result.GeometryHit = 1.0;
+						return Result;
+					}
+				}
+				else
+				{
+					Result.Color = MirageGeometryColor[GeometryIndex].rgb;
+					Result.DistanceMeters = (StepIndex + 1) * StepMeters;
+					Result.Valid = 1.0;
+					Result.GeometryHit = 1.0;
+					return Result;
+				}
+			}
+		}
+
+		float LayerBaseMeters = AtmosphereParameters0.w * 0.01;
+		float CurrentWorldHeightMeters = (RayPosition.z - PreViewTranslation.z) * 0.01;
+		if (AtmosphereParameters0.z < 0.0 && PreviousVerticalDirection < 0.0 && RayDirection.z >= 0.0)
+		{
+			// A turning point identifies the inferior-mirage branch, but it is not a
+			// terminal sky hit.  Continue the now-rising ray so it can intersect a
+			// vehicle or marker hidden behind the geometric horizon.
+			float TurnHeightMeters = max(CurrentWorldHeightMeters - LayerBaseMeters, 0.0);
+			Result.SkyTurn = max(Result.SkyTurn, saturate(1.0 - TurnHeightMeters / 1.5));
+		}
+		if (CurrentWorldHeightMeters < LayerBaseMeters)
+		{
+			return Result;
+		}
+
+		float4 Clip = mul(float4(RayPosition, 1.0), View.TranslatedWorldToClip);
+		if (Clip.w <= 0.0)
+		{
+			continue;
+		}
+
+		float2 SampleUV = ScreenPosToViewportUV(Clip.xy / Clip.w);
+		if (any(SampleUV <= 0.001) || any(SampleUV >= 0.999))
+		{
+			continue;
+		}
+
+		float2 DepthUV = ViewportUVToBufferUV(SampleUV);
+		float DeviceZ = SceneTexturesStruct.SceneDepthTexture.SampleLevel(
+			SceneTexturesStruct_SceneDepthTextureSampler, DepthUV, 0).r;
+		float SurfaceDepthCm = ConvertFromDeviceZ(DeviceZ);
+		float RayDepthCm = Clip.w;
+		float ThicknessCm = max(250.0, StepCentimeters * 1.6);
+
+		// Screen depth cannot represent hidden/off-screen surfaces and can falsely terminate a
+		// curved ray on the projected road. It is retained only for scenes without explicit
+		// world-space trace geometry.
+		if (MirageGeometryCount == 0u && StepIndex > 1 &&
+			RayDepthCm >= SurfaceDepthCm - ThicknessCm && RayDepthCm <= SurfaceDepthCm + ThicknessCm)
+		{
+			Result.UV = SampleUV;
+			Result.DistanceMeters = (StepIndex + 1) * StepMeters;
+			Result.Valid = 1.0;
+			break;
+		}
+	}
+	if (Result.SkyTurn > 0.5)
+	{
+		float3 SkyPoint = RayPosition + RayDirection * 1000000.0;
+		float4 SkyClip = mul(float4(SkyPoint, 1.0), View.TranslatedWorldToClip);
+		if (SkyClip.w > 0.0)
+		{
+			Result.UV = saturate(ScreenPosToViewportUV(SkyClip.xy / SkyClip.w));
+		}
+		Result.DistanceMeters = AtmosphereParameters1.y;
+		Result.Valid = 1.0;
+	}
+	return Result;
+}
+
+float4 MainPS(noperspective float4 UVAndScreenPos : TEXCOORD0, float4 SvPosition : SV_POSITION) : SV_Target0
+{
+	float2 UV = UVAndScreenPos.xy;
+	float4 Original = SceneColorTexture.SampleLevel(SceneColorSampler, UV, 0);
+	if (AtmosphereParameters1.w >= 3.5)
+	{
+		return Original;
+	}
+	float Type = MirageParameters0.w;
+	float HorizonMask = Type < 0.5
+		? saturate((UV.y - MirageParameters0.y) / max(MirageParameters0.z, 0.001))
+		: saturate(1.0 - abs(UV.y - MirageParameters0.y) / max(MirageParameters0.z, 0.001));
+	HorizonMask = HorizonMask * HorizonMask * (3.0 - 2.0 * HorizonMask);
+
+	if (AtmosphereParameters1.w > 0.5 && AtmosphereParameters1.w < 1.5)
+	{
+		// Temporary proof color: unmistakable bars prove this shader reached final composition.
+		float Bar = step(0.5, frac(UV.x * 20.0));
+		return lerp(float4(1.0, 0.0, 0.8, 1.0), float4(0.0, 1.0, 1.0, 1.0), Bar);
+	}
+
+	if (HorizonMask <= 0.001)
+	{
+		return Original;
+	}
+
+	float Separation = AtmosphereParameters1.z;
+	float BranchSign = Type < 0.5 ? -1.0 : 1.0;
+	FCurvedRayHit Primary = TraceCurvedRay(UV, 0.0);
+	FCurvedRayHit BranchA = TraceCurvedRay(UV, BranchSign * Separation);
+	FCurvedRayHit BranchB = TraceCurvedRay(UV, -BranchSign * Separation * 0.65);
+
+	float Time = View.GameTime * MirageParameters1.x;
+	float Turbulence = MirageNoise(float2(UV.x * MirageParameters1.y + Time, UV.y * 9.0 - Time * 0.61));
+	float2 TurbulenceOffset = float2(Turbulence * MirageParameters0.x, Turbulence * MirageParameters0.x * 0.2) * HorizonMask;
+
+	float4 PrimaryColor = Primary.GeometryHit > 0.5 && Primary.SurfaceSampleValid < 0.5 ? float4(Primary.Color, 1.0) :
+		SceneColorTexture.SampleLevel(SceneColorSampler, saturate(Primary.UV + TurbulenceOffset), 0);
+	float4 BranchAColor = BranchA.GeometryHit > 0.5 && BranchA.SurfaceSampleValid < 0.5 ? float4(BranchA.Color, 1.0) :
+		SceneColorTexture.SampleLevel(SceneColorSampler, saturate(BranchA.UV + TurbulenceOffset), 0);
+	float4 BranchBColor = BranchB.GeometryHit > 0.5 && BranchB.SurfaceSampleValid < 0.5 ? float4(BranchB.Color, 1.0) :
+		SceneColorTexture.SampleLevel(SceneColorSampler, saturate(BranchB.UV - TurbulenceOffset), 0);
+
+	float PrimaryWeight = Primary.Valid;
+	float AWeight = BranchA.Valid * (Type < 0.5 ? MirageParameters1.z : MirageParameters1.w);
+	float BWeight = BranchB.Valid * (Type < 0.5 ? MirageParameters1.z * 0.65 : MirageParameters1.w * 0.8);
+	float TotalWeight = PrimaryWeight + AWeight + BWeight;
+	float4 Refracted = TotalWeight > 0.001
+		? (PrimaryColor * PrimaryWeight + BranchAColor * AWeight + BranchBColor * BWeight) / TotalWeight
+		: Original;
+	float GeometryWeight = Primary.GeometryHit * PrimaryWeight +
+		BranchA.GeometryHit * AWeight + BranchB.GeometryHit * BWeight;
+	if (GeometryWeight > 0.001)
+	{
+		// Different optical branches traverse different path lengths through the
+		// inversion layer.  Preserve that transmission contrast so overlapping
+		// Fata Morgana images remain readable as separate physical bands.
+		float3 GeometryColor = (PrimaryColor.rgb * 0.98 * Primary.GeometryHit * PrimaryWeight +
+			BranchAColor.rgb * 1.03 * BranchA.GeometryHit * AWeight +
+			BranchBColor.rgb * 0.94 * BranchB.GeometryHit * BWeight) / GeometryWeight;
+		// The ray/triangle solution already supplies the visibility mask.  Do not
+		// attenuate a valid inverted image a second time with the screen-space band.
+		Refracted.rgb = lerp(Refracted.rgb, GeometryColor, saturate(GeometryWeight));
+	}
+
+	if (AtmosphereParameters1.w >= 2.5)
+	{
+		return float4(Primary.BoxHit, BranchA.BoxHit, BranchB.BoxHit, 1.0);
+	}
+
+	if (AtmosphereParameters1.w >= 1.5)
+	{
+		return float4(Primary.GeometryHit, BranchA.GeometryHit, BranchB.GeometryHit, 1.0);
+	}
+
+	float HitConfidence = saturate(TotalWeight);
+	float SkyBranchWeight = Primary.SkyTurn + BranchA.SkyTurn * AWeight + BranchB.SkyTurn * BWeight;
+	float GeometryVisibility = max(Primary.GeometryHit, max(BranchA.GeometryHit, BranchB.GeometryHit));
+	float SilverGlint = Type < 0.5 ? saturate(SkyBranchWeight) * (1.0 - GeometryVisibility) : 0.0;
+	float3 SkyDerivedSilver = saturate(Refracted.rgb * 1.03 + float3(0.015, 0.020, 0.025));
+	Refracted.rgb = lerp(Refracted.rgb, SkyDerivedSilver, SilverGlint * 0.62);
+	// A sky-returning inferior branch is a partially transmitting atmospheric image,
+	// not an opaque reflection.  Keep exact geometry hits fully readable while blending
+	// the silver pool through the asphalt with low-frequency surface shimmer.  This
+	// removes the diagnostic-looking hard band without using a screen-space mask.
+	float ShimmerTransmission = 0.48 + 0.10 * (Turbulence * 0.5 + 0.5);
+	float InferiorVisibility = max(GeometryVisibility, SilverGlint * ShimmerTransmission);
+	float SuperiorVisibility = max(GeometryVisibility, HorizonMask * HitConfidence);
+	return lerp(Original, Refracted, Type < 0.5 ? InferiorVisibility : SuperiorVisibility);
+}
